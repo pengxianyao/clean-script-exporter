@@ -1,18 +1,22 @@
 # Clean Script Exporter
 
-A terminal-based Python tool that packages a local script project into a DLP-safe `.zip` for emailing into a corporate environment (private banking / FI with strict DLP/CS controls).
+Terminal-based Python utility for packaging a local script project into a DLP-conscious zip file that can be shared or moved into a locked-down corporate environment.
 
----
+## What It Does
 
-## What it does
+- Opens a folder picker so you can choose the project to package.
+- Scans Python imports with `ast` and separates standard-library imports from third-party dependencies.
+- Traces runtime file references and warns when referenced files are missing.
+- Runs an interactive checklist for file types that should be stripped before export.
+- Writes a clean zip with a generated `requirements.txt` and a manifest of included files.
 
-1. **Folder picker** — GUI dialog to select your project folder
-2. **Dependency report** — scans all `.py` files via AST; splits imports into stdlib (no install needed) and third-party (must be installed on corporate PC)
-3. **Missing-file warnings** — detects runtime file references (e.g. `pd.read_excel("data/template.xlsx")`) and warns if they don't exist locally (i.e. the corporate machine must have them)
-4. **DLP stripping checklist** — interactive terminal checklist to strip dangerous file types before packaging; preferences saved per-project
-5. **Manifest + zip** — prints every file going into the zip, injects a `requirements.txt`, writes `{project-name}-clean-{YYYYMMDD}.zip`
+## Setup
 
----
+No third-party packages are required. Use Python 3.10+.
+
+```bash
+python --version
+```
 
 ## Usage
 
@@ -20,46 +24,48 @@ A terminal-based Python tool that packages a local script project into a DLP-saf
 python packager.py
 ```
 
-- A folder picker opens — select your project folder
-- Follow the terminal prompts
-- Output zip is written to the directory you ran the script from
+Flow:
 
-No external dependencies. Runs on Python 3.10+ (stdlib only).
+1. Select the project folder in the GUI picker.
+2. Review dependency and missing-file warnings.
+3. Confirm or adjust the DLP stripping checklist.
+4. Review the manifest.
+5. Use the generated `{project-name}-clean-{YYYYMMDD}.zip`.
 
----
+## Default DLP Blocklist
 
-## Default DLP blocklist
+The default checklist strips common local, binary, cache, and secret-bearing files:
 
-The following are stripped by default (toggleable):
+```text
+.pyc
+__pycache__/
+.exe
+.dll
+.db
+.log
+.env
+.DS_Store
+```
 
-`.pyc` · `__pycache__/` · `.exe` · `.dll` · `.db` · `.log` · `.env` · `.DS_Store`
+Preferences are saved to `packager-config.json` inside the selected project folder.
 
-Preferences are saved to `packager-config.json` inside the project folder and reloaded on the next run.
+## Repository Layout
 
----
+```text
+.
+|-- packager.py          # main tool
+|-- test_packager.py     # tests
+|-- PRD.md               # product requirements
+|-- issues/              # implementation tickets
+|-- run.bat              # Windows launcher
+|-- requirements.txt
+`-- README.md
+```
 
-## Running tests
+## Tests
 
 ```bash
 python test_packager.py
 ```
 
-Tests cover `ImportAnalyser` (stdlib/third-party split, deduplication, syntax error handling) and `FileTracer` (reachable file inclusion, data file detection, missing-file warnings).
-
----
-
-## Project structure
-
-```
-packager.py           # single-file tool — run this
-test_packager.py      # tests for ImportAnalyser and FileTracer
-PRD.md                # product requirements document
-issues/               # implementation issue tickets
-CLAUDE.md             # agent config
-```
-
----
-
-## Background
-
-Scripts are developed locally against simulated data and need to be transferred into a corporate environment that enforces DLP/CS policies. The current process is ad hoc — no structured dependency declaration, no repeatable checklist for stripping sensitive file types. This tool makes every transfer repeatable and compliant.
+Tests cover dependency detection, syntax-error handling, reachable file tracing, data-file detection, and missing-file warnings.
