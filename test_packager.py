@@ -5,7 +5,14 @@ from pathlib import Path
 # Add project root to path so we can import packager
 sys.path.insert(0, str(Path(__file__).parent))
 
-from packager import analyse_imports, trace_files
+from packager import (
+    analyse_imports,
+    build_entrypoints_text,
+    collect_runtime_py_files,
+    collect_safe_root_files,
+    detect_entrypoints,
+    trace_files,
+)
 
 
 def write(tmp: Path, rel: str, content: str) -> Path:
@@ -58,6 +65,26 @@ def test_empty_file_returns_empty():
         assert result["third_party"] == []
 
 
+def test_local_package_import_not_third_party():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        write(root, "profiler/__init__.py", "")
+        f = write(root, "profiler/__main__.py", "from profiler.column_profiler import profile_columns\n")
+        write(root, "profiler/column_profiler.py", "def profile_columns(): pass\n")
+        result = analyse_imports([f], root)
+        assert "profiler" not in result["third_party"]
+
+
+def test_runtime_py_files_exclude_tests():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        main = write(root, "profiler/__main__.py", "")
+        test_file = write(root, "tests/test_profiler.py", "import pytest\n")
+        files = collect_runtime_py_files(root)
+        assert main in files
+        assert test_file not in files
+
+
 # ── FileTracer tests ──────────────────────────────────────────────────────────
 
 def test_includes_all_py_files():
@@ -102,6 +129,52 @@ def test_included_data_file_not_in_warnings():
         script = write(root, "main.py", 'open("data.csv")\n')
         result = trace_files(root, [script])
         assert result["warnings"] == []
+
+
+def test_collect_safe_root_files_includes_docs_not_bat_runner():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        runner = write(root, "run.bat", "@echo off\n")
+        readme = write(root, "README.md", "# App\n")
+        write(root, "notes.txt", "ignore me\n")
+        files = collect_safe_root_files(root)
+        assert runner not in files
+        assert readme in files
+        assert root / "notes.txt" not in files
+
+
+def test_detects_package_module_entrypoint():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        main = write(root, "profiler/__main__.py", "def main(): pass\n")
+        entrypoints = detect_entrypoints(root, [main])
+        assert entrypoints == [{
+            "kind": "module",
+            "path": "profiler/__main__.py",
+            "command": "python -m profiler",
+        }]
+
+
+def test_detects_script_main_guard_entrypoint():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        script = write(root, "packager.py", 'if __name__ == "__main__":\n    main()\n')
+        entrypoints = detect_entrypoints(root, [script])
+        assert entrypoints == [{
+            "kind": "script",
+            "path": "packager.py",
+            "command": "python packager.py",
+        }]
+
+
+def test_build_entrypoints_text_lists_commands():
+    text = build_entrypoints_text([{
+        "kind": "module",
+        "path": "profiler/__main__.py",
+        "command": "python -m profiler",
+    }])
+    assert "python -m profiler" in text
+    assert "profiler/__main__.py" in text
 
 
 if __name__ == "__main__":

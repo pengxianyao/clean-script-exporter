@@ -42,8 +42,9 @@ def _stdlib_names() -> set[str]:
     }
 
 
-def analyse_imports(py_files: list[Path]) -> dict[str, list[str]]:
+def analyse_imports(py_files: list[Path], project_root: Path | None = None) -> dict[str, list[str]]:
     stdlib = _stdlib_names()
+    local_modules = _local_module_names(project_root or _common_root(py_files))
     found: set[str] = set()
     for path in py_files:
         try:
@@ -58,9 +59,31 @@ def analyse_imports(py_files: list[Path]) -> dict[str, list[str]]:
             elif isinstance(node, ast.ImportFrom):
                 if node.module and node.level == 0:
                     found.add(node.module.split(".")[0])
-    third_party = sorted(m for m in found if m not in stdlib)
+    third_party = sorted(m for m in found if m not in stdlib and m not in local_modules)
     stdlib_used = sorted(m for m in found if m in stdlib)
     return {"stdlib": stdlib_used, "third_party": third_party}
+
+
+def _common_root(paths: list[Path]) -> Path:
+    if not paths:
+        return Path.cwd()
+    try:
+        return Path(__import__("os").path.commonpath([str(p.parent) for p in paths]))
+    except ValueError:
+        return paths[0].parent
+
+
+def _local_module_names(root: Path) -> set[str]:
+    if not root.exists():
+        return set()
+
+    modules = {p.stem for p in root.glob("*.py")}
+    packages = {
+        p.parent.name
+        for p in root.rglob("__init__.py")
+        if not _is_test_path(p.relative_to(root))
+    }
+    return modules | packages
 
 
 # ── file tracer ──────────────────────────────────────────────────────────────
@@ -106,9 +129,124 @@ def trace_files(root: Path, py_files: list[Path]) -> dict:
     return {"include": include, "warnings": warnings}
 
 
+def collect_runtime_py_files(root: Path) -> list[Path]:
+    return sorted(
+        p for p in root.rglob("*.py")
+        if not _is_test_path(p.relative_to(root))
+    )
+
+
+def collect_safe_root_files(root: Path) -> set[Path]:
+    names = {
+        "README.md",
+        "readme.md",
+        "requirements.txt",
+        "pyproject.toml",
+        "setup.py",
+    }
+    return {root / name for name in names if (root / name).exists()}
+
+
+def _is_test_path(rel_path: Path) -> bool:
+    parts = {part.lower() for part in rel_path.parts}
+    return "tests" in parts or rel_path.name.lower().startswith("test_")
+
+
+def detect_entrypoints(root: Path, py_files: list[Path]) -> list[dict[str, str]]:
+    entrypoints: list[dict[str, str]] = []
+
+    for path in sorted(py_files):
+        rel = path.relative_to(root)
+        if rel.name == "__main__.py" and rel.parent != Path("."):
+            module = ".".join(rel.parent.parts)
+            entrypoints.append({
+                "kind": "module",
+                "path": rel.as_posix(),
+                "command": f"python -m {module}",
+            })
+            continue
+
+        if _has_main_guard(path):
+            entrypoints.append({
+                "kind": "script",
+                "path": rel.as_posix(),
+                "command": f"python {rel.as_posix()}",
+            })
+
+    return entrypoints
+
+
+def _has_main_guard(path: Path) -> bool:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _is_main_guard_test(node.test):
+            return True
+    return False
+
+
+def _is_main_guard_test(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Compare):
+        return False
+    if not _is_dunder_name(node.left):
+        return False
+    if len(node.ops) != 1 or not isinstance(node.ops[0], ast.Eq):
+        return False
+    if len(node.comparators) != 1:
+        return False
+    comp = node.comparators[0]
+    return isinstance(comp, ast.Constant) and comp.value == "__main__"
+
+
+def _is_dunder_name(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id == "__name__"
+
+
+def build_entrypoints_text(entrypoints: list[dict[str, str]]) -> str:
+    lines = [
+        "Entrypoints",
+        "===========",
+        "",
+        "Run these commands from the root of the extracted package.",
+        "",
+    ]
+
+    if not entrypoints:
+        lines += [
+            "No Python entrypoints were detected automatically.",
+            "Look for a README or a Python file containing if __name__ == \"__main__\".",
+            "",
+        ]
+        return "\n".join(lines)
+
+    for item in entrypoints:
+        lines += [
+            f"- {item['command']}",
+            f"  Source: {item['path']}",
+            "",
+        ]
+
+    return "\n".join(lines)
+
+
 # ── dlp filter ───────────────────────────────────────────────────────────────
 
-DEFAULT_BLOCKLIST = [".pyc", "__pycache__", ".exe", ".dll", ".db", ".log", ".env", ".DS_Store"]
+DEFAULT_BLOCKLIST = [
+    ".pyc",
+    "__pycache__",
+    ".exe",
+    ".dll",
+    ".db",
+    ".log",
+    ".env",
+    ".DS_Store",
+    ".bat",
+    ".cmd",
+    ".ps1",
+]
 
 
 def _load_config(config_path: Path) -> list[str]:
@@ -168,21 +306,40 @@ def apply_dlp_filter(files: set[Path], root: Path, config_path: Path) -> set[Pat
 
 # ── packager ─────────────────────────────────────────────────────────────────
 
-def build_zip(files: set[Path], packages: list[str], root: Path, output: Path) -> None:
+def build_zip(
+    files: set[Path],
+    packages: list[str],
+    root: Path,
+    output: Path,
+    entrypoints: list[dict[str, str]] | None = None,
+) -> None:
     sorted_files = sorted(files, key=lambda p: str(p.relative_to(root)))
+    has_requirements = any(f.relative_to(root).as_posix() == "requirements.txt" for f in sorted_files)
+    generated_packages = packages if not has_requirements else []
+    entrypoints = entrypoints or []
+    entrypoints_text = build_entrypoints_text(entrypoints)
 
     print("\n── Manifest ────────────────────────────────────────────────────")
     for f in sorted_files:
         print(f"  {f.relative_to(root)}")
-    if packages:
+    if generated_packages:
         print("  requirements.txt  (generated)")
-    print(f"\n  Total: {len(sorted_files)} file(s)" + (f" + requirements.txt" if packages else ""))
+    print("  ENTRYPOINTS.txt  (generated)")
+    print(f"\n  Total: {len(sorted_files)} file(s)" + (f" + requirements.txt" if generated_packages else ""))
+
+    print("\n── Entrypoints ─────────────────────────────────────────────────")
+    if entrypoints:
+        for item in entrypoints:
+            print(f"  {item['command']}  ({item['path']})")
+    else:
+        print("  No Python entrypoints detected automatically.")
 
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in sorted_files:
             zf.write(f, f.relative_to(root))
-        if packages:
-            zf.writestr("requirements.txt", "\n".join(packages) + "\n")
+        if generated_packages:
+            zf.writestr("requirements.txt", "\n".join(generated_packages) + "\n")
+        zf.writestr("ENTRYPOINTS.txt", entrypoints_text)
 
     print(f"\n── Done ────────────────────────────────────────────────────────")
     print(f"  Output: {output}")
@@ -194,19 +351,20 @@ def main() -> None:
     folder = pick_folder()
     print(f"\nProject folder: {folder}")
 
-    py_files = sorted(folder.rglob("*.py"))
+    py_files = collect_runtime_py_files(folder)
     if not py_files:
         print("No .py files found in folder. Exiting.")
         sys.exit(0)
 
     # Dependency report
     print("\n── Dependency Report ───────────────────────────────────────────")
-    report = analyse_imports(py_files)
+    report = analyse_imports(py_files, folder)
     print(f"  Stdlib (no install needed): {', '.join(report['stdlib']) or 'none'}")
     print(f"  Third-party (install on corporate PC): {', '.join(report['third_party']) or 'none'}")
 
     # File tracing
     trace = trace_files(folder, py_files)
+    entrypoints = detect_entrypoints(folder, py_files)
     if trace["warnings"]:
         print("\n── Missing File Warnings ───────────────────────────────────────")
         print("  These paths are referenced in code but not found locally.")
@@ -216,12 +374,13 @@ def main() -> None:
 
     # DLP filter
     config_path = folder / "packager-config.json"
-    final_files = apply_dlp_filter(trace["include"], folder, config_path)
+    candidate_files = trace["include"] | collect_safe_root_files(folder)
+    final_files = apply_dlp_filter(candidate_files, folder, config_path)
 
     # Build zip
     today = date.today().strftime("%Y%m%d")
     output = Path.cwd() / f"{folder.name}-clean-{today}.zip"
-    build_zip(final_files, report["third_party"], folder, output)
+    build_zip(final_files, report["third_party"], folder, output, entrypoints)
 
 
 if __name__ == "__main__":
